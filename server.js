@@ -8,6 +8,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
@@ -20,18 +21,6 @@ dotenv.config();
 
 class YahooMailMCPServer {
     constructor() {
-        this.server = new Server(
-            {
-                name: 'yahoo-mail-mcp',
-                version: '3.0.0',
-            },
-            {
-                capabilities: {
-                    tools: {},
-                },
-            }
-        );
-
         // Store active SSE transports (for routing messages)
         this.transports = new Map();
 
@@ -43,16 +32,40 @@ class YahooMailMCPServer {
         // In production, use Redis with short TTL (60 seconds)
         this.authCodes = new Map();
 
-        this.setupToolHandlers();
+        this.server = this.createMcpServer();
         this.setupErrorHandling();
+    }
+
+    /**
+     * Create a configured MCP Server instance (used for stdio, SSE, and stateless Streamable HTTP)
+     */
+    createMcpServer() {
+        const server = new Server(
+            {
+                name: 'yahoo-mail-mcp',
+                version: '3.0.0',
+            },
+            {
+                capabilities: {
+                    tools: {},
+                },
+            }
+        );
+
+        this.setupToolHandlers(server);
+        server.onerror = (error) => {
+            console.error('[MCP Error]', error);
+        };
+
+        return server;
     }
 
     /**
      * Setup MCP tool handlers
      */
-    setupToolHandlers() {
+    setupToolHandlers(targetServer = this.server) {
         // Handle tool listing
-        this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+        targetServer.setRequestHandler(ListToolsRequestSchema, async () => {
             return {
                 tools: [
                     {
@@ -309,7 +322,7 @@ class YahooMailMCPServer {
         });
 
         // Handle tool execution
-        this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        targetServer.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
 
             try {
@@ -1266,9 +1279,9 @@ class YahooMailMCPServer {
         app.use(cors({
             origin: true,  // Allow all origins (Render's proxy may modify origin headers)
             credentials: true,
-            methods: ['GET', 'POST', 'OPTIONS'],
-            allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
-            exposedHeaders: ['Content-Type'],
+            methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+            allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'mcp-session-id', 'mcp-protocol-version'],
+            exposedHeaders: ['Content-Type', 'mcp-session-id'],
             maxAge: 86400  // Cache preflight for 24 hours
         }));
 
@@ -1397,6 +1410,16 @@ class YahooMailMCPServer {
         app.get('/.well-known/oauth-protected-resource/mcp/sse', (req, res) => {
             console.error('[OAuth] Protected resource metadata for /mcp/sse requested');
             res.json(getProtectedResourceMetadata(req, '/mcp/sse'));
+        });
+
+        app.get('/.well-known/oauth-authorization-server/mcp', (req, res) => {
+            console.error('[OAuth] Authorization server metadata for /mcp requested');
+            res.json(getOAuthMetadata(req));
+        });
+
+        app.get('/.well-known/oauth-protected-resource/mcp', (req, res) => {
+            console.error('[OAuth] Protected resource metadata for /mcp requested');
+            res.json(getProtectedResourceMetadata(req, '/mcp'));
         });
 
         // OAuth Authorization Endpoint (Authorization Code Flow)
@@ -1612,6 +1635,58 @@ class YahooMailMCPServer {
             });
         });
 
+        // Streamable HTTP endpoint for MCP (recommended for Gemini and Claude)
+        app.post('/mcp', async (req, res) => {
+            try {
+                const mcpServer = this.createMcpServer();
+                const transport = new StreamableHTTPServerTransport({
+                    sessionIdGenerator: undefined
+                });
+
+                res.on('close', () => {
+                    transport.close();
+                    mcpServer.close();
+                });
+
+                await mcpServer.connect(transport);
+                await transport.handleRequest(req, res, req.body);
+            } catch (error) {
+                console.error('[StreamableHTTP] Error handling MCP request:', error);
+                if (!res.headersSent) {
+                    res.status(500).json({
+                        jsonrpc: '2.0',
+                        error: {
+                            code: -32603,
+                            message: 'Internal server error'
+                        },
+                        id: null
+                    });
+                }
+            }
+        });
+
+        app.get('/mcp', (req, res) => {
+            res.status(405).json({
+                jsonrpc: '2.0',
+                error: {
+                    code: -32000,
+                    message: 'Method not allowed.'
+                },
+                id: null
+            });
+        });
+
+        app.delete('/mcp', (req, res) => {
+            res.status(405).json({
+                jsonrpc: '2.0',
+                error: {
+                    code: -32000,
+                    message: 'Method not allowed.'
+                },
+                id: null
+            });
+        });
+
         // SSE endpoint for MCP
         app.get('/mcp/sse', async (req, res) => {
             try {
@@ -1689,6 +1764,7 @@ class YahooMailMCPServer {
                 description: 'MCP server for Yahoo Mail access via IMAP',
                 endpoints: {
                     health: '/health',
+                    mcp: '/mcp',
                     sse: '/mcp/sse',
                     message: '/mcp/message'
                 },
