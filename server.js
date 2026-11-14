@@ -15,6 +15,7 @@ import { simpleParser } from 'mailparser';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 
 // Load environment variables from .env file (for local development)
 dotenv.config();
@@ -1235,6 +1236,52 @@ class YahooMailMCPServer {
         });
     }
 
+    /**
+     * Create a stateless HMAC-signed access token that survives Render restarts
+     */
+    signAccessToken(clientId, scope = 'mcp', ttlSeconds = 2592000) {
+        const secret = process.env.OAUTH_CLIENT_SECRET;
+        if (!secret) {
+            const fallback = Buffer.from(`${clientId}:${Date.now()}:${Math.random()}`).toString('base64');
+            this.validTokens.add(fallback);
+            return fallback;
+        }
+        const payload = Buffer.from(JSON.stringify({
+            sub: clientId,
+            scope,
+            exp: Math.floor(Date.now() / 1000) + ttlSeconds
+        })).toString('base64url');
+        const sig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+        return `${payload}.${sig}`;
+    }
+
+    /**
+     * Verify a stateless HMAC-signed access token (or fallback in-memory token)
+     */
+    verifyAccessToken(token) {
+        if (this.validTokens && this.validTokens.has(token)) {
+            return true;
+        }
+        const secret = process.env.OAUTH_CLIENT_SECRET;
+        if (!secret || !token || !token.includes('.')) {
+            return false;
+        }
+        const [payload, sig] = token.split('.');
+        if (!payload || !sig) return false;
+        const expectedSig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+        const sigBuf = Buffer.from(sig);
+        const expectedBuf = Buffer.from(expectedSig);
+        if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+            return false;
+        }
+        try {
+            const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+            return typeof data.exp === 'number' && data.exp > Math.floor(Date.now() / 1000);
+        } catch (e) {
+            return false;
+        }
+    }
+
     setupErrorHandling() {
         this.server.onerror = (error) => {
             console.error('[MCP Error]', error);
@@ -1343,8 +1390,8 @@ class YahooMailMCPServer {
 
             const token = authHeader.substring(7); // Remove 'Bearer ' prefix
 
-            // Validate token (check if it's in our valid tokens set)
-            if (!this.validTokens || !this.validTokens.has(token)) {
+            // Validate token (stateless HMAC signature or in-memory fallback)
+            if (!this.verifyAccessToken(token)) {
                 console.error('[Auth] Invalid or expired access token');
                 return res.status(401).json({
                     error: 'invalid_token',
@@ -1571,32 +1618,30 @@ class YahooMailMCPServer {
                 // Delete used auth code (one-time use)
                 this.authCodes.delete(code);
 
-                // Generate access token
-                const accessToken = Buffer.from(`${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                // Generate stateless signed access token (30-day TTL)
+                const accessToken = this.signAccessToken(reqClientId, authData.scope || 'mcp', 2592000);
 
-                console.error('[OAuth] Access token generated from authorization code');
+                console.error('[OAuth] Signed access token generated from authorization code');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: 2592000,
                     scope: authData.scope || 'mcp'
                 });
             }
 
             // Handle Client Credentials Grant
             if (grantType === 'client_credentials') {
-                // Generate access token
-                const accessToken = Buffer.from(`${clientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                // Generate stateless signed access token (30-day TTL)
+                const accessToken = this.signAccessToken(clientId, 'mcp', 2592000);
 
-                console.error('[OAuth] Access token generated via client credentials');
+                console.error('[OAuth] Signed access token generated via client credentials');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: 2592000,
                     scope: 'mcp'
                 });
             }
