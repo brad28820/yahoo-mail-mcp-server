@@ -16,6 +16,8 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import nodemailer from 'nodemailer';
+import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 
 // Load environment variables from .env file (for local development)
 dotenv.config();
@@ -317,6 +319,127 @@ class YahooMailMCPServer {
                             type: 'object',
                             properties: {}
                         }
+                    },
+                    {
+                        name: 'create_draft',
+                        description: 'Create a draft email in Yahoo Mail Draft folder. Optionally provide replyToUid to create a threaded reply draft.',
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                to: {
+                                    type: 'string',
+                                    description: 'Recipient email address(es), comma-separated (optional if replyToUid is provided)'
+                                },
+                                subject: {
+                                    type: 'string',
+                                    description: 'Email subject (optional if replyToUid is provided)'
+                                },
+                                body: {
+                                    type: 'string',
+                                    description: 'Email body content (plain text or HTML when isHtml is true)'
+                                },
+                                isHtml: {
+                                    type: 'boolean',
+                                    description: 'Whether body is HTML (default: false)',
+                                    default: false
+                                },
+                                cc: {
+                                    type: 'string',
+                                    description: 'CC email address(es), comma-separated'
+                                },
+                                bcc: {
+                                    type: 'string',
+                                    description: 'BCC email address(es), comma-separated'
+                                },
+                                replyToUid: {
+                                    type: 'number',
+                                    description: 'Optional UID of the email being replied to, for proper threading'
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder containing replyToUid (default: INBOX)',
+                                    default: 'INBOX'
+                                },
+                                replyAll: {
+                                    type: 'boolean',
+                                    description: 'Include original To/CC recipients when replyToUid is provided (default: false)',
+                                    default: false
+                                }
+                            },
+                            required: ['body']
+                        }
+                    },
+                    {
+                        name: 'reply_email',
+                        description: 'Send a threaded reply to an existing email by UID via Yahoo SMTP.',
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                uid: {
+                                    type: 'number',
+                                    description: 'UID of the email to reply to'
+                                },
+                                body: {
+                                    type: 'string',
+                                    description: 'Reply body content (plain text or HTML when isHtml is true)'
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder containing the original email (default: INBOX)',
+                                    default: 'INBOX'
+                                },
+                                isHtml: {
+                                    type: 'boolean',
+                                    description: 'Whether body is HTML (default: false)',
+                                    default: false
+                                },
+                                replyAll: {
+                                    type: 'boolean',
+                                    description: 'Reply to all original recipients (default: false)',
+                                    default: false
+                                },
+                                cc: {
+                                    type: 'string',
+                                    description: 'Additional CC email address(es), comma-separated'
+                                }
+                            },
+                            required: ['uid', 'body']
+                        }
+                    },
+                    {
+                        name: 'send_email',
+                        description: 'Send a new email via Yahoo SMTP.',
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                to: {
+                                    type: 'string',
+                                    description: 'Recipient email address(es), comma-separated'
+                                },
+                                subject: {
+                                    type: 'string',
+                                    description: 'Email subject'
+                                },
+                                body: {
+                                    type: 'string',
+                                    description: 'Email body content (plain text or HTML when isHtml is true)'
+                                },
+                                isHtml: {
+                                    type: 'boolean',
+                                    description: 'Whether body is HTML (default: false)',
+                                    default: false
+                                },
+                                cc: {
+                                    type: 'string',
+                                    description: 'CC email address(es), comma-separated'
+                                },
+                                bcc: {
+                                    type: 'string',
+                                    description: 'BCC email address(es), comma-separated'
+                                }
+                            },
+                            required: ['to', 'subject', 'body']
+                        }
                     }
                 ]
             };
@@ -367,6 +490,15 @@ class YahooMailMCPServer {
 
                     case 'list_folders':
                         return await this.listFolders();
+
+                    case 'create_draft':
+                        return await this.createDraft(args);
+
+                    case 'reply_email':
+                        return await this.replyEmail(args);
+
+                    case 'send_email':
+                        return await this.sendEmail(args);
 
                     default:
                         throw new Error(`Unknown tool: ${name}`);
@@ -1234,6 +1366,286 @@ class YahooMailMCPServer {
                 });
             });
         });
+    }
+
+    /**
+     * Create a Nodemailer SMTP transporter for Yahoo Mail
+     */
+    createSmtpTransporter() {
+        if (!process.env.YAHOO_EMAIL || !process.env.YAHOO_APP_PASSWORD) {
+            throw new Error('YAHOO_EMAIL or YAHOO_APP_PASSWORD environment variables are not set');
+        }
+        return nodemailer.createTransport({
+            host: 'smtp.mail.yahoo.com',
+            port: 465,
+            secure: true,
+            auth: {
+                user: process.env.YAHOO_EMAIL,
+                pass: process.env.YAHOO_APP_PASSWORD
+            }
+        });
+    }
+
+    /**
+     * Fetch threading headers and recipient context for replying to an email by UID
+     */
+    async getReplyContext(uid, folder = 'INBOX') {
+        const imap = await this.createImapConnection();
+
+        return new Promise((resolve, reject) => {
+            imap.openBox(folder, true, (err) => {
+                if (err) {
+                    imap.end();
+                    reject(new Error(`Failed to open folder ${folder}: ${err.message}`));
+                    return;
+                }
+
+                const fetch = imap.fetch([uid], { bodies: '' });
+                let found = false;
+
+                fetch.on('message', (msg) => {
+                    found = true;
+                    let buffer = '';
+                    msg.on('body', (stream) => {
+                        stream.on('data', (chunk) => {
+                            buffer += chunk.toString('utf8');
+                        });
+                    });
+                    msg.once('end', () => {
+                        simpleParser(buffer, (parseErr, parsed) => {
+                            imap.end();
+                            if (parseErr) {
+                                reject(new Error(`Failed to parse original email: ${parseErr.message}`));
+                                return;
+                            }
+
+                            const selfEmail = (process.env.YAHOO_EMAIL || '').toLowerCase();
+                            const extractAddrs = (addrObj) => {
+                                if (!addrObj || !addrObj.value) return [];
+                                return addrObj.value
+                                    .map(v => v.address)
+                                    .filter(Boolean);
+                            };
+
+                            const replyToAddrs = extractAddrs(parsed.replyTo);
+                            const fromAddrs = extractAddrs(parsed.from);
+                            const primaryTo = replyToAddrs.length > 0 ? replyToAddrs : fromAddrs;
+
+                            const allTo = extractAddrs(parsed.to).filter(a => a.toLowerCase() !== selfEmail);
+                            const allCc = extractAddrs(parsed.cc).filter(a => a.toLowerCase() !== selfEmail);
+
+                            const origSubject = parsed.subject || '';
+                            const replySubject = /^re:/i.test(origSubject.trim())
+                                ? origSubject
+                                : `Re: ${origSubject}`;
+
+                            const refs = [];
+                            if (Array.isArray(parsed.references)) {
+                                refs.push(...parsed.references);
+                            } else if (typeof parsed.references === 'string' && parsed.references.trim()) {
+                                refs.push(parsed.references.trim());
+                            }
+                            if (parsed.messageId && !refs.includes(parsed.messageId)) {
+                                refs.push(parsed.messageId);
+                            }
+
+                            resolve({
+                                to: primaryTo.join(', '),
+                                replyAllTo: [...new Set([...primaryTo, ...allTo])].join(', '),
+                                replyAllCc: [...new Set(allCc)].join(', '),
+                                subject: replySubject,
+                                inReplyTo: parsed.messageId || undefined,
+                                references: refs.length > 0 ? refs.join(' ') : undefined
+                            });
+                        });
+                    });
+                });
+
+                fetch.once('error', (fetchErr) => {
+                    imap.end();
+                    reject(new Error(`Failed to fetch email UID ${uid}: ${fetchErr.message}`));
+                });
+
+                fetch.once('end', () => {
+                    if (!found) {
+                        imap.end();
+                        reject(new Error(`Email with UID ${uid} not found in ${folder}`));
+                    }
+                });
+            });
+        });
+    }
+
+    /**
+     * Create a draft email in Yahoo Mail Draft folder
+     */
+    async createDraft(args = {}) {
+        const {
+            to,
+            subject,
+            body,
+            isHtml = false,
+            cc,
+            bcc,
+            replyToUid,
+            folder = 'INBOX',
+            replyAll = false
+        } = args;
+
+        if (!body) {
+            throw new Error('body is required');
+        }
+
+        let resolvedTo = to;
+        let resolvedCc = cc;
+        let resolvedSubject = subject;
+        let inReplyTo;
+        let references;
+
+        if (replyToUid) {
+            const ctx = await this.getReplyContext(replyToUid, folder);
+            if (!resolvedTo) {
+                resolvedTo = replyAll ? ctx.replyAllTo : ctx.to;
+            }
+            if (replyAll && !resolvedCc && ctx.replyAllCc) {
+                resolvedCc = ctx.replyAllCc;
+            }
+            if (!resolvedSubject) {
+                resolvedSubject = ctx.subject;
+            }
+            inReplyTo = ctx.inReplyTo;
+            references = ctx.references;
+        }
+
+        const mailOptions = {
+            from: process.env.YAHOO_EMAIL,
+            to: resolvedTo,
+            cc: resolvedCc,
+            bcc,
+            subject: resolvedSubject || '(No Subject)',
+            ...(isHtml ? { html: body } : { text: body }),
+            ...(inReplyTo ? { inReplyTo } : {}),
+            ...(references ? { references } : {})
+        };
+
+        const rawMessage = await new Promise((resolve, reject) => {
+            const composer = new MailComposer(mailOptions);
+            composer.compile().build((err, message) => {
+                if (err) reject(err);
+                else resolve(message);
+            });
+        });
+
+        const imap = await this.createImapConnection();
+
+        return new Promise((resolve, reject) => {
+            imap.append(rawMessage, { mailbox: 'Draft', flags: ['\Draft'] }, (err) => {
+                imap.end();
+                if (err) {
+                    reject(new Error(`Failed to save draft: ${err.message}`));
+                    return;
+                }
+                resolve({
+                    content: [{
+                        type: 'text',
+                        text: JSON.stringify({
+                            status: 'draft_created',
+                            folder: 'Draft',
+                            to: resolvedTo || null,
+                            cc: resolvedCc || null,
+                            subject: mailOptions.subject,
+                            inReplyTo: inReplyTo || null
+                        }, null, 2)
+                    }]
+                });
+            });
+        });
+    }
+
+    /**
+     * Reply to an existing email by UID via Yahoo SMTP
+     */
+    async replyEmail(args = {}) {
+        const {
+            uid,
+            body,
+            folder = 'INBOX',
+            isHtml = false,
+            replyAll = false,
+            cc
+        } = args;
+
+        if (!uid || !body) {
+            throw new Error('uid and body are required');
+        }
+
+        const ctx = await this.getReplyContext(uid, folder);
+        const to = replyAll ? ctx.replyAllTo : ctx.to;
+        if (!to) {
+            throw new Error(`Could not determine recipient address for UID ${uid}`);
+        }
+
+        const mergedCc = [replyAll ? ctx.replyAllCc : '', cc || '']
+            .filter(Boolean)
+            .join(', ');
+
+        const transporter = this.createSmtpTransporter();
+        const info = await transporter.sendMail({
+            from: process.env.YAHOO_EMAIL,
+            to,
+            ...(mergedCc ? { cc: mergedCc } : {}),
+            subject: ctx.subject,
+            ...(isHtml ? { html: body } : { text: body }),
+            ...(ctx.inReplyTo ? { inReplyTo: ctx.inReplyTo } : {}),
+            ...(ctx.references ? { references: ctx.references } : {})
+        });
+
+        return {
+            content: [{
+                type: 'text',
+                text: JSON.stringify({
+                    status: 'sent',
+                    messageId: info.messageId,
+                    to,
+                    cc: mergedCc || null,
+                    subject: ctx.subject,
+                    inReplyTo: ctx.inReplyTo || null
+                }, null, 2)
+            }]
+        };
+    }
+
+    /**
+     * Send a new email via Yahoo SMTP
+     */
+    async sendEmail(args = {}) {
+        const { to, subject, body, isHtml = false, cc, bcc } = args;
+        if (!to || !subject || !body) {
+            throw new Error('to, subject, and body are required');
+        }
+
+        const transporter = this.createSmtpTransporter();
+        const info = await transporter.sendMail({
+            from: process.env.YAHOO_EMAIL,
+            to,
+            ...(cc ? { cc } : {}),
+            ...(bcc ? { bcc } : {}),
+            subject,
+            ...(isHtml ? { html: body } : { text: body })
+        });
+
+        return {
+            content: [{
+                type: 'text',
+                text: JSON.stringify({
+                    status: 'sent',
+                    messageId: info.messageId,
+                    to,
+                    cc: cc || null,
+                    subject
+                }, null, 2)
+            }]
+        };
     }
 
     /**
