@@ -19,7 +19,7 @@ COPY package*.json ./
 FROM base AS dependencies
 
 # Install all dependencies (including dev dependencies for building)
-RUN npm ci
+RUN npm install
 
 FROM base AS production
 
